@@ -1,0 +1,305 @@
+---
+title: "How ISIS Uses Twitter"
+output: html_document
+---
+
+### Loading the Data and Libraries
+
+```{r load_data, message=FALSE, warning=FALSE}
+library(ggplot2)
+library(dplyr)
+library(formattable) 
+library(tm)
+library(SnowballC)
+library(wordcloud)
+library(rpart)
+library(caret)
+library(rpart.plot)
+library(rattle)
+library(recipes)
+library(tidyverse)
+library(rsample)
+library(keras)
+library(tidyquant)
+
+tweets_data <- read.csv("tweets.csv")
+```
+
+### Data Preprocessing 
+
+```{r preprocess_data, message=FALSE, warning=FALSE}
+# visualize raw data
+glimpse(tweets_data)
+
+# How many total tweets in the dataset? Are any of the tweets repeats?
+tweets_data %>% summarise(`Total Tweets`=n(),`Repeated Tweets`=n_distinct(tweets)-n())
+
+# No repeated tweets, though are there any retweets?
+# Likely going to remove retweets during classification of author
+tweets_data2 <- tweets_data %>% mutate(original_or_retweet = grepl("^\\bRT\\b",tweets), original_or_retweet = ifelse(original_or_retweet,"Retweets","Original Tweets")) 
+tweets_data2%>%group_by(original_or_retweet)%>% summarize(n_tweet=n())%>% head()
+tweets_data2 %>% ggplot(aes(original_or_retweet)) + geom_bar(fill="darkblue")+ggtitle("Number of Original Tweets vs. Retweets")
+
+# Need to decide whether or not to perform classification on name or username
+# How many names vs usernames? How many name-username pairs?
+sprintf("Number of unique names: %d",n_distinct(tweets_data$name))
+sprintf("Number of unique usernames: %d",n_distinct(tweets_data$username))
+name_username_pairs <- tweets_data %>% group_by(name,username) %>% select(name,username) %>% summarise() %>% ungroup()
+sprintf("Number of unique name-usernames pairs: %d",n_distinct(name_username_pairs))
+
+# Equal number of unique names and usernames, but 10 extra name-username pairs then there should be if each unique name belonged to one unique username
+# Do any names have multiple usernames, or vice versa, or both?
+name_username_pairs %>% group_by(name) %>% summarize(num_usernames=n()) %>% filter(num_usernames>=2) %>% formattable( list(num_usernames=color_bar("lightgray")), align='l') %>% arrange(desc(num_usernames))
+
+name_username_pairs %>% group_by(username) %>% summarize(num_names=n()) %>% filter(num_names>=2) %>% formattable(list(num_names=color_bar("lightgray")), align='l') %>% arrange(desc(num_names)) 
+
+# Other than username "Uncle_SamCoco" (fun fact: his description supports USA), the attribute "username" seems to have less names attached to each, so classification will be done based on usernames
+# How many followers do the top-15 followed usernames have?
+followers_data <- tweets_data %>% group_by(username) %>% summarise(num_followers=max(followers)) %>% arrange(desc(num_followers))
+followers_data <- followers_data[1:15,]
+ggplot(followers_data,aes(x=username,y=num_followers))+geom_bar(stat="identity",fill="darkblue")+theme(axis.text.x=element_text(angle=30,hjust=1))
+
+num_tweets_data <- tweets_data %>% group_by(username) %>% summarise(num_tweets=n()) %>% arrange(desc(num_tweets)) 
+num_tweets_data <- num_tweets_data[1:15,]
+ggplot(num_tweets_data, aes(x=username,y=num_tweets))+geom_bar(stat = "identity",fill="darkblue")+theme(axis.text.x=element_text(angle=30,hjust=1))
+
+scatter_users=tweets_data %>% select(username,followers,tweets)%>% group_by(username)%>% summarise(num_followers=max(followers),num_tweets=n())
+scatter_users%>%ggplot(aes(num_tweets,num_followers))+geom_text(aes(label=ifelse((num_followers>4000)|num_followers>2000&num_tweets>500,as.character(username),'')))+geom_point(color="darkblue")
+
+#tweets_data <- tweets_data[(tweets_data$username=="WarReporter1")|(tweets_data$username=="RamiAlLolah")|(tweets_data$username=="warrnews")|(tweets_data$username=="Nidalgazaui")|(tweets_data$username=="Freedom_speech2")|(tweets_data$username=="NaseemAhmed50")|(tweets_data$username=="MaghrebiHD"),]
+
+tweets_data <- tweets_data[(tweets_data$username=="WarReporter1")|(tweets_data$username=="RamiAlLolah")|(tweets_data$username=="warrnews")|(tweets_data$username=="Nidalgazaui"),]
+sprintf("Number of unique usernames: %d",n_distinct(tweets_data$username))
+glimpse(tweets_data)
+
+# remove attributes name, description, location, followers, numberstatuses, and time, as they will not be necessary to perform classification of authorship based on tweet content 
+# keep attribute username as target class, and attribute tweets as the feature to use for classification
+# possibly investigate tweets over time (per second, minute, hour, etc)
+tweets_data <- tweets_data %>% select(-name) %>% select(-description) %>% select(-location) %>% select(-followers) %>% select(-numberstatuses) %>% select(-time)
+glimpse(tweets_data)
+```
+
+### Text Analysis: Document Term Matrix
+
+```{r dtm, message=FALSE, warning=FALSE}
+tweets_data$tweets <- sapply(tweets_data$tweets,function(tweet) iconv(tweet, "", "ASCII"))
+tweets_corpus <- Corpus(VectorSource(tweets_data$tweets))
+tweets_corpus
+
+tweets_corpus <- tm_map(tweets_corpus, removePunctuation)
+tweets_corpus <- tm_map(tweets_corpus, removeWords, stopwords('english'))
+tweets_corpus <- tm_map(tweets_corpus, stemDocument)
+tweets_corpus <- tm_map(tweets_corpus, stripWhitespace)
+
+wordcloud(tweets_corpus, max.words = 150, random.order = FALSE, rot.per = .3, colors=brewer.pal(12, "Paired"))
+
+tweets_dtm <- DocumentTermMatrix(tweets_corpus)
+# Use the commented code below to create a document term matrix of the TF-IDF
+#tweets_dtm <- DocumentTermMatrix(tweets_corpus, control = list(weighting = weightTfIdf))
+tweets_dtm
+
+term_freq <- colSums(as.matrix(tweets_dtm))
+term_freq_sort <- sort(term_freq,decreasing=T)
+term_freq_df <- data.frame(term=names(term_freq_sort), frequency=term_freq_sort) 
+glimpse(term_freq_df)
+
+#top_term_freq <- nrow(term_freq_df[term_freq_df$frequency>=40,])
+#sprintf("Top frequency terms: %d",top_term_freq)
+#term_freq_df <- term_freq_df[(term_freq_df$frequency>=40),]
+#glimpse(term_freq_df)
+head(term_freq_df, 15)
+term_freq_df %>% filter(frequency >= 100) %>% ggplot(aes(term, frequency)) + geom_bar(stat="identity",fill="darkblue") + theme(axis.text.x=element_text(angle=45, hjust=1))
+
+tweets_dtm = removeSparseTerms(tweets_dtm, 0.995) 
+#dtm 
+
+tweets_dtm_df <- data.frame(username = tweets_data$username, as.matrix(tweets_dtm))
+tweets_dtm_df$username <- factor(tweets_dtm_df$username)
+head(tweets_dtm_df, 6)
+```
+
+### Training and Testing Dataset
+
+```{r split_data, message=FALSE, warning=FALSE}
+# rename levels for simplicity 
+levels(tweets_dtm_df$username)
+levels(tweets_dtm_df$username) <- c(0,1,2,3)
+levels(tweets_dtm_df$username)
+
+set.seed(123)
+train_test_split <- initial_split(tweets_dtm_df, prop = 0.8)
+train_set <- training(train_test_split)
+test_set <- testing(train_test_split)
+dim(train_set)
+dim(test_set)
+```
+
+### Sequential Neural Network Model
+
+```{r nn_model, message=FALSE, warning=FALSE}
+# Sequential Neural Network Model
+recipe_obj <- recipe(username ~ ., data=train_set) %>% prep(data=train_set)
+recipe_obj
+x_train <- bake(recipe_obj, new_data=train_set) %>% select(-username)
+x_test <- bake(recipe_obj, new_data=test_set) %>% select(-username)
+head(x_train, 15)
+
+y_train_vec  = as.numeric(as.character(train_set$username))
+y_test_vec  = as.numeric(as.character(test_set$username))
+glimpse(y_train_vec)
+glimpse(y_test_vec)
+y_train_vec<-to_categorical(y_train_vec, num_classes=NULL)
+
+set.seed(1234)
+time_train = proc.time() # timing model training 
+nn_model <- keras_model_sequential()
+nn_model %>% 
+  layer_dense(units = 70,
+              kernel_initializer = "uniform",
+              activation = "relu",
+              input_shape = ncol(x_train)) %>% 
+  layer_dropout(rate = 0.15) %>% 
+  layer_dense(units = 4,
+              kernel_initializer = "uniform",
+              activation = "softmax") %>% 
+  compile(optimizer = "Adagrad",
+          loss = "categorical_crossentropy",
+          metrics = c("accuracy")
+  )
+nn_model
+
+nn_fit <- fit(
+  object           = nn_model, 
+  x                = as.matrix(x_train), 
+  y                = y_train_vec,
+  batch_size       = 150, 
+  epochs           = 50, 
+  validation_split = 0.15 
+)
+nn_fit
+proc.time() - time_train
+
+plot(nn_fit) + theme_tq() + scale_color_tq() + scale_fill_tq() + labs(title = "Neural Network Training Results")
+
+time_predict = proc.time() # timing model predictions
+y_class_vec <- predict_classes(object = nn_model, x = as.matrix(x_test)) %>% as.vector()
+proc.time() - time_predict
+
+actual_class = as.factor(y_test_vec)
+estimate_class = as.factor(y_class_vec)
+actual_estimate_tbl <- tibble(actual_class,estimate_class)
+actual_estimate_tbl
+
+confusionMatrix(actual_class, estimate_class)
+```
+
+### Random Forest Model
+
+```{r forest_model, message=FALSE, warning=FALSE}
+library(randomForest)
+set.seed(2345)
+# Training random forest model
+time_train = proc.time() # timing model training 
+forest_model <- randomForest(username ~. , data=train_set, importance = TRUE)
+proc.time() - time_train
+print(forest_model)
+
+# Predictions based on random forest model
+time_predict = proc.time() # timing model predictions
+forest_predict <- predict(forest_model, test_set, type="class")
+proc.time() - time_predict
+
+# Results of predictions
+confusionMatrix(forest_predict, test_set$username)
+```
+
+### XGBoost Model
+
+```{r xgboost_model, message=FALSE, warning=FALSE}
+library(xgboost)
+class = as.integer(tweets_dtm_df$username)-1
+tweets_dtm_df$username = NULL
+# Create training and testing sets and XGB Matrices
+split = sample(nrow(tweets_dtm_df),floor(0.80*nrow(tweets_dtm_df)))
+training_set = as.matrix(tweets_dtm_df[split,])
+testing_set = as.matrix(tweets_dtm_df[-split,])
+training_class = class[split] 
+testing_class = class[-split] 
+train_xgb = xgb.DMatrix(data=training_set,label=training_class)
+test_xgb = xgb.DMatrix(data=testing_set,label=testing_class)
+
+# Set parameters and run XGBoost cross validation function
+param_list <- list(booster="gbtree", objective="multi:softprob", eval_metric="mlogloss", num_class=4)
+crossval_xgb <- xgb.cv(params=param_list, data=train_xgb, nrounds=100, nfold=5, showsd=TRUE, print.every.n=15, maximize=FALSE, prediction=TRUE)
+
+# Make predictions on training set using cross validation results 
+set.seed(234)
+train_predictions <- data.frame(crossval_xgb$pred) %>% mutate(label=training_class+1, max=max.col(.,))
+glimpse(train_predictions)
+train_predict_table <- table(true=training_class+1, pred=train_predictions$max)
+
+# Function calculates error of classification
+error <- function(mat) {
+  matrix = as.matrix(mat)
+  class_error = 1-sum(diag(matrix)) / sum(matrix)
+  return (class_error)
+}
+cat("Classification error:", error(train_predict_table), "\n")
+confusionMatrix(factor(train_predictions$label), factor(train_predictions$max), mode="everything")
+
+# Training and testing the XGB model
+set.seed(345)
+time_train = proc.time() # timing model training 
+xgb_model <- xgb.train(params=param_list, data=train_xgb, nrounds=100)
+proc.time() - time_train
+
+time_predict = proc.time() # timing model predictions
+xgb_predictions <- predict(xgb_model, newdata=test_xgb)
+proc.time() - time_predict
+
+predictions_matrix <- matrix(xgb_predictions, nrow=4, ncol=length(xgb_predictions)/4) %>% t() %>% data.frame() %>% mutate(max = max.col(.,), label=testing_class+1) 
+
+test_predict_table <- table(true=testing_class+1, pred=predictions_matrix$max)
+cat("Classification error:", error(test_predict_table), "\n")
+confusionMatrix(factor(predictions_matrix$label), factor(predictions_matrix$max), mode="everything")
+```
+
+### Ensemble Models 
+
+```{r ensembles, message=FALSE, warning=FALSE}
+# convert predictions from factor to numeric to calculate RMSE
+forest_predict_num  = as.numeric(forest_predict)
+test_set_num = as.numeric(test_set$username)
+nn_predict_num = as.numeric(estimate_class)
+xgb_predict_num = as.numeric(factor(predictions_matrix$label))
+
+# Root mean squared error for random forest model
+forest_rmse = sqrt(mean((test_set_num-forest_predict_num)^2))
+forest_rmse
+# Root mean squared error for sequential neural network model
+nn_rmse = sqrt(mean((test_set_num-nn_predict_num)^2))
+nn_rmse
+# Root mean squared error for XGB model
+xgb_rmse = sqrt(mean((test_set_num-xgb_predict_num)^2))
+xgb_rmse
+
+# Ensemble of random forest and neural network models
+predictions<-(forest_predict_num+nn_predict_num)/2
+predictions_rmse<-sqrt((sum((test_set_num-predictions)^2))/nrow(test_set))
+predictions_rmse
+
+# Ensemble of random forest and XGBoost models
+predictions<-(forest_predict_num*2+xgb_predict_num)/3
+predictions_rmse<-sqrt((sum((test_set_num-predictions)^2))/nrow(test_set))
+predictions_rmse
+
+# Ensemble of neural network and XGBoost models
+predictions<-(nn_predict_num+xgb_predict_num)/2
+predictions_rmse<-sqrt((sum((test_set_num-predictions)^2))/nrow(test_set))
+predictions_rmse
+
+# Ensemble of random forest, neural network, and XGB models
+predictions<-(forest_predict_num+nn_predict_num*2+xgb_predict_num*2)/5
+predictions_rmse<-sqrt((sum((test_set_num-predictions)^2))/nrow(test_set))
+predictions_rmse
+```
